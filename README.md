@@ -166,6 +166,7 @@ A detailed upload history is generated showing:
 | PHOTO_UPLOADER_DIRECTORY       | Source directory     | /photos | Yes      |
 | PHOTO_UPLOADER_CONCURRENT      | Concurrent uploads   | 4       | No       |
 | PHOTO_UPLOADER_RENAME_FILES    | Enable file renaming | false   | No       |
+| PHOTO_UPLOADER_DRY_RUN         | Enable dry run       | false   | No       |
 | GOOGLE_CLOUD_PROJECT           | Project ID           | -       | Yes      |
 | GOOGLE_APPLICATION_CREDENTIALS | Credentials path     | -       | Yes      |
 
