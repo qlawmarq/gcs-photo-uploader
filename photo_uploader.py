@@ -172,18 +172,41 @@ class PhotoUploader:
         try:
             with Image.open(filepath) as img:
                 width, height = img.size
-                exif_dict = piexif.load(img.info.get('exif', b''))
-                if exif_dict.get('Exif'):
-                    for field in [36867, 36868, 306]:  # Date fields
-                        if field in exif_dict['Exif']:
-                            date_str = exif_dict['Exif'][field].decode('utf-8')
-                            creation_date = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-                            break
-                    
-                    if exif_dict.get('0th') and 272 in exif_dict['0th']:  # Camera model
-                        camera_model = exif_dict['0th'][272].decode('utf-8').strip()
+                
+                exif_date = None
+                try:
+                    exif_dict = piexif.load(img.info.get('exif', b''))
+                    if exif_dict.get('Exif'):
+                        for field in [36867, 36868, 306]:  # Date fields
+                            if field in exif_dict['Exif']:
+                                date_str = exif_dict['Exif'][field].decode('utf-8')
+                                exif_date = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                                break
+                except Exception as e:
+                    self.logger.debug(f"Failed to extract EXIF date from {filepath}: {e}")
+
+                if not exif_date and hasattr(img, '_getexif'):
+                    exif = img._getexif()
+                    if exif:
+                        if 306 in exif:
+                            try:
+                                date_str = exif[306]
+                                exif_date = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                            except Exception as e:
+                                self.logger.debug(f"Failed to parse TIFF DateTime from {filepath}: {e}")
+
+                if exif_date:
+                    creation_date = exif_date
+
+                if exif_dict.get('0th') and 272 in exif_dict['0th']:
+                    camera_model = exif_dict['0th'][272].decode('utf-8').strip()
+                elif hasattr(img, '_getexif') and img._getexif():
+                    exif = img._getexif()
+                    if exif and 272 in exif:
+                        camera_model = str(exif[272]).strip()
+
         except Exception as e:
-            self.logger.debug(f"Failed to extract EXIF from {filepath}: {e}")
+            self.logger.debug(f"Failed to extract metadata from {filepath}: {e}")
 
         return PhotoMetadata(
             file_hash=file_hash,
@@ -223,12 +246,10 @@ class PhotoUploader:
             files_to_process = []
             duplicates_found = []
             
-            # ファイル処理（両モードで同じフロー）
             for filepath in local_files:
                 try:
                     metadata = self._extract_photo_metadata(filepath)
                     
-                    # 重複チェック（両モードで実行）
                     duplicate_result = self.duplicate_detector.find_duplicate(metadata)
                     if duplicate_result:
                         location, duplicate_path = duplicate_result
@@ -279,16 +300,20 @@ class PhotoUploader:
         try:
             jpeg_path = filepath.with_suffix('.jpg')
             with WandImage(filename=str(filepath)) as img:
-                original_exif = img.profiles.get('exif', None)
+                # Get all profiles (including EXIF, ICC, etc.)
+                profiles = img.profiles
+                
+                # Convert to JPEG
                 img.compression_quality = 95
                 img.save(filename=str(jpeg_path))
 
-                if original_exif:
-                    with WandImage(filename=str(jpeg_path)) as jpeg_img:
-                        jpeg_img.profiles['exif'] = original_exif
-                        jpeg_img.save(filename=str(jpeg_path))
+                # Restore all profiles to the new JPEG
+                with WandImage(filename=str(jpeg_path)) as jpeg_img:
+                    for profile_name, profile_data in profiles.items():
+                        jpeg_img.profiles[profile_name] = profile_data
+                    jpeg_img.save(filename=str(jpeg_path))
 
-            self.logger.info(f"Converted {filepath.name} to JPEG")
+            self.logger.info(f"Converted {filepath.name} to JPEG with metadata preserved")
             return jpeg_path
         except Exception as e:
             self.logger.error(f"HEIC conversion failed for {filepath}: {str(e)}")
@@ -329,6 +354,49 @@ class PhotoUploader:
             self.logger.error(f"Failed to prepare {filepath} for upload: {str(e)}")
             return None
 
+    def _preserve_metadata(self, source_path: Path, temp_path: Path) -> None:
+        """
+        Preserve metadata
+        """
+        try:
+            with Image.open(source_path) as src_img:
+                exif_data = src_img.info.get('exif')
+                tiff_data = None
+                if hasattr(src_img, '_getexif'):
+                    tiff_data = src_img._getexif()
+
+            with Image.open(temp_path) as dst_img:
+                temp_output = temp_path.with_suffix('.tmp')
+                
+                if exif_data:
+                    dst_img.save(temp_output, 
+                            dst_img.format, 
+                            exif=exif_data,
+                            quality='keep')
+                elif tiff_data:
+                    # PIL doesn't directly support TIFF tag copying
+                    # Use exiftool as fallback
+                    dst_img.save(temp_output, 
+                            dst_img.format,
+                            quality='keep')
+                    if shutil.which('exiftool'):
+                        subprocess.run([
+                            'exiftool',
+                            '-overwrite_original',
+                            '-TagsFromFile',
+                            str(source_path),
+                            str(temp_output)
+                        ], check=True)
+                else:
+                    dst_img.save(temp_output, 
+                            dst_img.format,
+                            quality='keep')
+
+                shutil.move(temp_output, temp_path)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to preserve metadata: {e}")
+
     def _upload_file(self, filepath: Path) -> bool:
         """Upload single file to Google Cloud Storage."""
         try:
@@ -337,7 +405,7 @@ class PhotoUploader:
             # Generate destination path
             date_str = metadata.creation_date.strftime('%Y%m%d_%H%M%S')
             filename = (f"{date_str}_{random.randint(1000, 9999)}{filepath.suffix.lower()}"
-                       if self.rename_files else filepath.name)
+                    if self.rename_files else filepath.name)
             destination_path = f"{metadata.creation_date.year}/{metadata.creation_date.month:02d}/{filename}"
 
             if self.dry_run:
@@ -346,17 +414,25 @@ class PhotoUploader:
                                 f"date={metadata.creation_date.isoformat()}, "
                                 f"camera={metadata.camera_model or 'unknown'}")
             else:
-                blob = self.bucket.blob(destination_path)
-                blob.upload_from_filename(str(filepath))
-                
-                blob.metadata = {
-                    'upload_date': datetime.now().isoformat(),
-                    'photo_date': metadata.creation_date.isoformat(),
-                    'file_hash': metadata.file_hash,
-                    'original_name': filepath.name,
-                    'camera_model': metadata.camera_model or 'unknown'
-                }
-                blob.patch()
+                with tempfile.NamedTemporaryFile(suffix=filepath.suffix) as temp_file:
+                    temp_path = Path(temp_file.name)
+                    
+                    shutil.copy2(filepath, temp_path)
+                    
+                    self._preserve_metadata(filepath, temp_path)
+                    
+                    blob = self.bucket.blob(destination_path)
+                    blob.upload_from_filename(str(temp_path))
+                    
+                    blob.metadata = {
+                        'upload_date': datetime.now().isoformat(),
+                        'photo_date': metadata.creation_date.isoformat(),
+                        'file_hash': metadata.file_hash,
+                        'original_name': filepath.name,
+                        'camera_model': metadata.camera_model or 'unknown'
+                    }
+                    blob.patch()
+                    
                 self.logger.info(f"Uploaded: {filepath.name} -> {destination_path}")
 
             metadata.cloud_path = destination_path
