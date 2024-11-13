@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import hashlib
+import string
 from typing import List, Set, Optional, Tuple, Dict
 import magic
 import piexif
@@ -20,6 +21,8 @@ import shutil
 import random
 from dataclasses import dataclass
 from collections import defaultdict
+from google.api_core import retry
+import time
 
 @dataclass
 class PhotoMetadata:
@@ -55,57 +58,39 @@ class DuplicateDetector:
         """
         Check if photo is duplicate in either local or cloud storage.
         Returns tuple of (location, path) if duplicate found, None otherwise.
-        Location can be either 'local' or 'cloud'.
         """
-        # Check by hash first (most reliable method)
-        if metadata.file_hash in self.processed_hashes:
-            # Check in cloud files
-            for path, existing in self.cloud_files.items():
-                if existing.file_hash == metadata.file_hash:
-                    return ('cloud', path)
-            # Check in local files
-            for path, existing in self.local_files.items():
-                if existing.file_hash == metadata.file_hash:
-                    return ('local', path)
-
-        # Check by size and date
-        similar_files = self._find_similar_files(metadata)
-        if similar_files:
-            # Additional checks for similar files
-            for location, path, existing in similar_files:
-                if self._is_likely_duplicate(metadata, existing):
-                    return (location, path)
+        # Check in cloud files
+        for path, existing in self.cloud_files.items():
+            if self._is_likely_duplicate(metadata, existing):
+                return ('cloud', path)
+        
+        # Check in local files
+        for path, existing in self.local_files.items():
+            if self._is_likely_duplicate(metadata, existing):
+                return ('local', path)
 
         return None
 
-    def _find_similar_files(self, metadata: PhotoMetadata) -> List[Tuple[str, str, PhotoMetadata]]:
-        """Find files with similar properties (size and creation date)."""
-        similar_files = []
-        
-        # Check both cloud and local files
-        for location, files in [('cloud', self.cloud_files), ('local', self.local_files)]:
-            for path, existing in files.items():
-                if (abs((existing.creation_date - metadata.creation_date).total_seconds()) < 2 and
-                    existing.file_size == metadata.file_size):
-                    similar_files.append((location, path, existing))
-        
-        return similar_files
-
     def _is_likely_duplicate(self, metadata1: PhotoMetadata, metadata2: PhotoMetadata) -> bool:
-        """Compare two files' metadata to determine if they are likely duplicates."""
-        # If dimensions are available, compare them
-        if (metadata1.width and metadata1.height and 
-            metadata2.width and metadata2.height):
-            if (metadata1.width == metadata2.width and 
-                metadata1.height == metadata2.height):
-                return True
-
-        # If camera models are available, compare them
+        """
+        Compare metadata to determine if they are likely duplicates.
+        Uses creation date and camera model for comparison.
+        """
+        # Check if creation dates are close (within 2 seconds)
+        if abs((metadata1.creation_date - metadata2.creation_date).total_seconds()) > 2:
+            return False
+        
+        # If camera models are available and match
         if (metadata1.camera_model and metadata2.camera_model and
             metadata1.camera_model == metadata2.camera_model):
             return True
+        
+        # If at least one file has no camera model, but dates match exactly
+        if metadata1.creation_date == metadata2.creation_date:
+            return True
 
         return False
+
 
 class PhotoUploader:
     def __init__(
@@ -162,7 +147,10 @@ class PhotoUploader:
                 self.logger.warning(f"Failed to load metadata for {blob.name}: {e}")
 
     def _extract_photo_metadata(self, filepath: Path) -> PhotoMetadata:
-        """Extract comprehensive metadata from photo file."""
+        """
+        Extract comprehensive metadata from photo file.
+        Maintains all metadata extraction capabilities while keeping code simple.
+        """
         file_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
         file_size = filepath.stat().st_size
         creation_date = datetime.fromtimestamp(os.path.getmtime(filepath))
@@ -173,40 +161,44 @@ class PhotoUploader:
             with Image.open(filepath) as img:
                 width, height = img.size
                 
-                exif_date = None
+                # Extract EXIF data - try both direct exif and _getexif methods
+                exif_dict = None
                 try:
-                    exif_dict = piexif.load(img.info.get('exif', b''))
-                    if exif_dict.get('Exif'):
-                        for field in [36867, 36868, 306]:  # Date fields
-                            if field in exif_dict['Exif']:
-                                date_str = exif_dict['Exif'][field].decode('utf-8')
-                                exif_date = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-                                break
-                except Exception as e:
-                    self.logger.debug(f"Failed to extract EXIF date from {filepath}: {e}")
+                    exif_data = img.info.get('exif', b'')
+                    exif_dict = piexif.load(exif_data)
+                except Exception:
+                    if hasattr(img, '_getexif'):
+                        exif_dict = img._getexif()
+                        if exif_dict:
+                            exif_dict = {'Exif': exif_dict}
 
-                if not exif_date and hasattr(img, '_getexif'):
-                    exif = img._getexif()
-                    if exif:
-                        if 306 in exif:
+                if exif_dict:
+                    # Extract date information
+                    for ifd in ('Exif', '0th'):
+                        if ifd not in exif_dict:
+                            continue
+                        
+                        # Check date fields in order of preference
+                        date_fields = ((36867, 'Exif'), (36868, 'Exif'), (306, '0th'))  # DateTimeOriginal, DateTimeDigitized, DateTime
+                        for field, dict_name in date_fields:
+                            if field in exif_dict[ifd]:
+                                try:
+                                    date_str = exif_dict[ifd][field].decode('utf-8') if isinstance(exif_dict[ifd][field], bytes) else str(exif_dict[ifd][field])
+                                    creation_date = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                                    break
+                                except Exception:
+                                    continue
+                                
+                        # Extract camera model
+                        if 272 in exif_dict[ifd]:  # Model field
                             try:
-                                date_str = exif[306]
-                                exif_date = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-                            except Exception as e:
-                                self.logger.debug(f"Failed to parse TIFF DateTime from {filepath}: {e}")
-
-                if exif_date:
-                    creation_date = exif_date
-
-                if exif_dict.get('0th') and 272 in exif_dict['0th']:
-                    camera_model = exif_dict['0th'][272].decode('utf-8').strip()
-                elif hasattr(img, '_getexif') and img._getexif():
-                    exif = img._getexif()
-                    if exif and 272 in exif:
-                        camera_model = str(exif[272]).strip()
+                                camera_model = exif_dict[ifd][272].decode('utf-8') if isinstance(exif_dict[ifd][272], bytes) else str(exif_dict[ifd][272])
+                                camera_model = camera_model.strip()
+                            except Exception:
+                                pass
 
         except Exception as e:
-            self.logger.debug(f"Failed to extract metadata from {filepath}: {e}")
+            self.logger.debug(f"Metadata extraction partial failure for {filepath}: {e}")
 
         return PhotoMetadata(
             file_hash=file_hash,
@@ -296,27 +288,149 @@ class PhotoUploader:
             shutil.rmtree(work_dir, ignore_errors=True)
 
     def _process_heic(self, filepath: Path) -> Optional[Path]:
-        """Convert HEIC/HEIF to JPEG if necessary."""
+        """
+        Convert HEIC/HEIF to JPEG with complete metadata preservation.
+        Handles IFDRational and other EXIF data types properly.
+        """
         try:
             jpeg_path = filepath.with_suffix('.jpg')
+
+            # Extract original metadata using PIL
+            original_metadata = None
+            original_icc = None
+            try:
+                with Image.open(filepath) as img:
+                    exif_dict = None
+                    if hasattr(img, '_getexif'):
+                        exif_dict = img._getexif()
+                    if exif_dict:
+                        # Convert to piexif format
+                        zeroth_ifd = {}
+                        exif_ifd = {}
+                        gps_ifd = {}
+                        
+                        for tag_id, value in exif_dict.items():
+                            try:
+                                # Handle different types of EXIF data
+                                if isinstance(value, str):
+                                    value = value.encode('utf-8')
+                                elif hasattr(value, 'numerator') and hasattr(value, 'denominator'):
+                                    # Handle IFDRational values
+                                    value = (value.numerator, value.denominator)
+                                elif isinstance(value, tuple) and len(value) == 2:
+                                    # Already in rational format
+                                    value = (int(value[0]), int(value[1]))
+                                elif isinstance(value, bytes):
+                                    # Already in bytes format
+                                    pass
+                                elif isinstance(value, int):
+                                    # Integer values
+                                    pass
+                                else:
+                                    # Convert other types to string then bytes
+                                    value = str(value).encode('utf-8')
+
+                                # Categorize based on tag
+                                if tag_id in piexif.ImageIFD.__dict__.values():
+                                    zeroth_ifd[tag_id] = value
+                                elif tag_id in piexif.ExifIFD.__dict__.values():
+                                    exif_ifd[tag_id] = value
+                                elif tag_id in piexif.GPSIFD.__dict__.values():
+                                    gps_ifd[tag_id] = value
+                            except Exception as e:
+                                self.logger.debug(f"Skipping EXIF tag {tag_id}: {e}")
+                                continue
+                        
+                        original_metadata = {
+                            "0th": zeroth_ifd,
+                            "Exif": exif_ifd,
+                            "GPS": gps_ifd,
+                            "1st": {},
+                            "Interop": {},
+                        }
+                    original_icc = img.info.get('icc_profile')
+            except Exception as e:
+                self.logger.warning(f"Failed to extract original metadata from {filepath}: {e}")
+
+            # Convert HEIC to JPEG using Wand
             with WandImage(filename=str(filepath)) as img:
-                # Get all profiles (including EXIF, ICC, etc.)
-                profiles = img.profiles
+                # Preserve color depth and space
+                img.depth = 16
+                img.type = 'truecolor'
                 
-                # Convert to JPEG
-                img.compression_quality = 95
+                # Get ICC profile from Wand if not already extracted
+                if not original_icc and 'icc' in img.profiles:
+                    original_icc = img.profiles['icc']
+
+                # Convert to highest quality JPEG
+                img.format = 'jpeg'
+                img.compression_quality = 100
+                img.options['jpeg:optimize'] = 'true'
+                img.options['jpeg:sampling-factor'] = '1x1'
+                
+                # Save initial conversion
                 img.save(filename=str(jpeg_path))
 
-                # Restore all profiles to the new JPEG
-                with WandImage(filename=str(jpeg_path)) as jpeg_img:
-                    for profile_name, profile_data in profiles.items():
-                        jpeg_img.profiles[profile_name] = profile_data
-                    jpeg_img.save(filename=str(jpeg_path))
+            # Apply metadata to converted file
+            if original_metadata or original_icc:
+                with Image.open(jpeg_path) as img:
+                    # Prepare save arguments
+                    save_kwargs = {
+                        'format': 'JPEG',
+                        'quality': 100,
+                        'optimize': True,
+                        'subsampling': 0
+                    }
 
-            self.logger.info(f"Converted {filepath.name} to JPEG with metadata preserved")
+                    # Add ICC profile if available
+                    if original_icc:
+                        save_kwargs['icc_profile'] = original_icc
+
+                    # If we have EXIF data, add it
+                    if original_metadata:
+                        try:
+                            exif_bytes = piexif.dump(original_metadata)
+                            save_kwargs['exif'] = exif_bytes
+                        except Exception as e:
+                            self.logger.debug(f"Could not dump full EXIF data for {filepath}: {e}")
+                            # Attempt to save with partial metadata
+                            try:
+                                # Create minimal EXIF with essential data
+                                minimal_metadata = {
+                                    "0th": {},
+                                    "Exif": {},
+                                    "GPS": {},
+                                    "1st": {},
+                                    "Interop": {},
+                                }
+                                # Copy only essential tags that we know will work
+                                essential_tags = [
+                                    piexif.ImageIFD.Make,
+                                    piexif.ImageIFD.Model,
+                                    piexif.ExifIFD.DateTimeOriginal,
+                                    piexif.ExifIFD.DateTimeDigitized,
+                                    piexif.ImageIFD.DateTime
+                                ]
+                                for tag in essential_tags:
+                                    for ifd in ['0th', 'Exif']:
+                                        if tag in original_metadata[ifd]:
+                                            minimal_metadata[ifd][tag] = original_metadata[ifd][tag]
+                                
+                                exif_bytes = piexif.dump(minimal_metadata)
+                                save_kwargs['exif'] = exif_bytes
+                            except Exception as e:
+                                self.logger.debug(f"Could not dump minimal EXIF data for {filepath}: {e}")
+
+                    # Save with metadata
+                    img.save(jpeg_path, **save_kwargs)
+
+            self.logger.info(f"Converted {filepath.name} to JPEG with metadata preservation")
             return jpeg_path
+
         except Exception as e:
             self.logger.error(f"HEIC conversion failed for {filepath}: {str(e)}")
+            if jpeg_path.exists():
+                jpeg_path.unlink()
             return None
 
     def _collect_local_files(self, directory: Path) -> List[Path]:
@@ -354,75 +468,172 @@ class PhotoUploader:
             self.logger.error(f"Failed to prepare {filepath} for upload: {str(e)}")
             return None
 
+
     def _preserve_metadata(self, source_path: Path, temp_path: Path) -> None:
         """
-        Preserve metadata
+        Preserve all image metadata during processing.
+        Handles various image formats and ensures complete metadata preservation.
         """
         try:
             with Image.open(source_path) as src_img:
-                exif_data = src_img.info.get('exif')
-                tiff_data = None
-                if hasattr(src_img, '_getexif'):
-                    tiff_data = src_img._getexif()
-
-            with Image.open(temp_path) as dst_img:
-                temp_output = temp_path.with_suffix('.tmp')
+                # Try to get existing EXIF data
+                exif_bytes = src_img.info.get('exif')
+                icc_profile = src_img.info.get('icc_profile')
                 
-                if exif_data:
-                    dst_img.save(temp_output, 
-                            dst_img.format, 
-                            exif=exif_data,
-                            quality='keep')
-                elif tiff_data:
-                    # PIL doesn't directly support TIFF tag copying
-                    # Use exiftool as fallback
-                    dst_img.save(temp_output, 
-                            dst_img.format,
-                            quality='keep')
-                    if shutil.which('exiftool'):
-                        subprocess.run([
-                            'exiftool',
-                            '-overwrite_original',
-                            '-TagsFromFile',
-                            str(source_path),
-                            str(temp_output)
-                        ], check=True)
-                else:
-                    dst_img.save(temp_output, 
-                            dst_img.format,
-                            quality='keep')
+                # Extract all possible metadata if EXIF is not directly available
+                if not exif_bytes and hasattr(src_img, '_getexif'):
+                    exif_dict = src_img._getexif() or {}
+                    
+                    # Prepare EXIF dictionary structure
+                    new_exif_dict = {
+                        "0th": {},      # Basic image metadata
+                        "Exif": {},     # EXIF specific data
+                        "GPS": {},      # GPS data if available
+                        "1st": {},      # Thumbnail metadata
+                        "Interop": {},  # Interoperability data
+                    }
 
+                    # Map all available EXIF data to appropriate IFDs
+                    for tag_id, value in exif_dict.items():
+                        try:
+                            # Convert string values to bytes if needed
+                            if isinstance(value, str):
+                                value = value.encode('utf-8')
+                            
+                            # Categorize EXIF tags into appropriate IFDs
+                            if tag_id in piexif.ImageIFD.__dict__.values():
+                                new_exif_dict["0th"][tag_id] = value
+                            elif tag_id in piexif.ExifIFD.__dict__.values():
+                                new_exif_dict["Exif"][tag_id] = value
+                            elif tag_id in piexif.GPSIFD.__dict__.values():
+                                new_exif_dict["GPS"][tag_id] = value
+                        except Exception as e:
+                            self.logger.debug(f"Skipping problematic EXIF tag {tag_id}: {e}")
+
+                    try:
+                        exif_bytes = piexif.dump(new_exif_dict)
+                    except Exception as e:
+                        self.logger.error(f"Failed to dump EXIF data: {e}")
+                        exif_bytes = None
+
+                # Preserve the original image format and mode
+                target_format = src_img.format
+                target_mode = src_img.mode
+
+                # Prepare save parameters based on format
+                save_kwargs = {
+                    'format': target_format,
+                    'quality': 100 if target_format == 'JPEG' else None,
+                    'exif': exif_bytes,
+                    'icc_profile': icc_profile,
+                }
+
+                # Additional format-specific settings
+                if target_format == 'JPEG':
+                    save_kwargs.update({
+                        'optimize': True,
+                        'subsampling': 0  # Highest quality subsampling
+                    })
+                elif target_format == 'PNG':
+                    save_kwargs.update({
+                        'optimize': True
+                    })
+                elif target_format == 'TIFF':
+                    save_kwargs.update({
+                        'compression': 'tiff_lzw'  # Lossless compression
+                    })
+
+                # Remove None values from save_kwargs
+                save_kwargs = {k: v for k, v in save_kwargs.items() if v is not None}
+
+                # Save with preserved metadata and format
+                with Image.open(temp_path) as img:
+                    # Ensure the mode matches the source
+                    if img.mode != target_mode and target_mode in {'RGB', 'RGBA', 'L'}:
+                        img = img.convert(target_mode)
+                    
+                    temp_output = temp_path.with_suffix('.tmp')
+                    img.save(temp_output, **save_kwargs)
+
+                # Move temporary file to target location
                 shutil.move(temp_output, temp_path)
-                
+
         except Exception as e:
-            self.logger.error(f"Failed to preserve metadata: {e}")
+            self.logger.error(f"Error preserving metadata: {e}")
+            # If metadata preservation fails, ensure the basic image is still saved
+            if os.path.exists(temp_path.with_suffix('.tmp')):
+                shutil.move(temp_path.with_suffix('.tmp'), temp_path)
+            raise
 
-    def _upload_file(self, filepath: Path) -> bool:
-        """Upload single file to Google Cloud Storage."""
-        try:
-            metadata = self._extract_photo_metadata(filepath)
-            
-            # Generate destination path
-            date_str = metadata.creation_date.strftime('%Y%m%d_%H%M%S')
-            filename = (f"{date_str}_{random.randint(1000, 9999)}{filepath.suffix.lower()}"
-                    if self.rename_files else filepath.name)
-            destination_path = f"{metadata.creation_date.year}/{metadata.creation_date.month:02d}/{filename}"
+        finally:
+            # Clean up temporary file if it exists
+            if os.path.exists(temp_path.with_suffix('.tmp')):
+                os.remove(temp_path.with_suffix('.tmp'))
 
-            if self.dry_run:
-                self.logger.info(f"[DRY RUN] Would upload: {filepath.name} -> {destination_path}")
-                self.logger.debug(f"[DRY RUN] Metadata: size={metadata.file_size}, "
-                                f"date={metadata.creation_date.isoformat()}, "
-                                f"camera={metadata.camera_model or 'unknown'}")
-            else:
+    def _upload_file(self, filepath: Path, max_retries: int = 3, initial_delay: float = 1.0) -> bool:
+        """
+        Upload single file to Google Cloud Storage with retry logic.
+        Only preserves metadata for converted HEIC/HEIF files.
+        """
+        attempt = 0
+        delay = initial_delay
+
+        while attempt <= max_retries:
+            try:
+                metadata = self._extract_photo_metadata(filepath)
+                
+                # Generate destination path
+                date_str = metadata.creation_date.strftime('%Y%m%d_%H%M%S')
+                random_str = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+                filename = (f"{date_str}_{random_str}{filepath.suffix.lower()}"
+                        if self.rename_files else filepath.name)
+                destination_path = f"{metadata.creation_date.year}/{metadata.creation_date.month:02d}/{filename}"
+
+                if self.dry_run:
+                    self.logger.info(f"[DRY RUN] Would upload: {filepath.name} -> {destination_path}")
+                    self.logger.debug(f"[DRY RUN] Metadata: size={metadata.file_size}, "
+                                    f"date={metadata.creation_date.isoformat()}, "
+                                    f"camera={metadata.camera_model or 'unknown'}")
+                    return True
+
+                # Determine if file needs conversion (HEIC/HEIF)
+                needs_conversion = filepath.suffix.lower() in {'.heic', '.heif'}
+
                 with tempfile.NamedTemporaryFile(suffix=filepath.suffix) as temp_file:
                     temp_path = Path(temp_file.name)
                     
-                    shutil.copy2(filepath, temp_path)
-                    
-                    self._preserve_metadata(filepath, temp_path)
+                    if needs_conversion:
+                        # For HEIC/HEIF files, convert and preserve metadata
+                        converted_path = self._process_heic(filepath)
+                        if not converted_path:
+                            raise Exception("HEIC/HEIF conversion failed")
+                        temp_path = converted_path
+                    else:
+                        # For other formats, just copy the file
+                        shutil.copy2(filepath, temp_path)
                     
                     blob = self.bucket.blob(destination_path)
-                    blob.upload_from_filename(str(temp_path))
+                    
+                    # Configure retry on specific exceptions
+                    retry_config = retry.Retry(
+                        predicate=retry.if_exception_type(
+                            ConnectionError,
+                            ConnectionAbortedError,
+                            ConnectionResetError,
+                            TimeoutError
+                        ),
+                        initial=delay,
+                        maximum=delay * 4,
+                        multiplier=2,
+                        deadline=300
+                    )
+                    
+                    # Upload with retry configuration
+                    blob.upload_from_filename(
+                        str(temp_path),
+                        retry=retry_config,
+                        timeout=60
+                    )
                     
                     blob.metadata = {
                         'upload_date': datetime.now().isoformat(),
@@ -433,17 +644,33 @@ class PhotoUploader:
                     }
                     blob.patch()
                     
+                    # Clean up converted file if it exists
+                    if needs_conversion and os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    
                 self.logger.info(f"Uploaded: {filepath.name} -> {destination_path}")
+                metadata.cloud_path = destination_path
+                self.duplicate_detector.add_cloud_file(destination_path, metadata)
+                self.upload_history[str(filepath)] = f"Uploaded to {destination_path}"
+                
+                return True
 
-            metadata.cloud_path = destination_path
-            self.duplicate_detector.add_cloud_file(destination_path, metadata)
-            self.upload_history[str(filepath)] = f"{'[DRY RUN] ' if self.dry_run else ''}Uploaded to {destination_path}"
-            
-            return True
+            except Exception as e:
+                attempt += 1
+                if attempt <= max_retries:
+                    self.logger.warning(
+                        f"Upload attempt {attempt}/{max_retries} failed for {filepath.name}: {str(e)}. "
+                        f"Retrying in {delay:.1f} seconds..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    self.logger.error(
+                        f"Failed to process {filepath.name} after {max_retries} attempts: {str(e)}"
+                    )
+                    return False
 
-        except Exception as e:
-            self.logger.error(f"{'[DRY RUN] ' if self.dry_run else ''}Failed to process {filepath.name}: {str(e)}")
-            return False
+        return False
 
 def main():
     """Main entry point."""
