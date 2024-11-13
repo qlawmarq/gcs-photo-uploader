@@ -1,0 +1,33 @@
+{
+  "title": "IMG_0118.JPG",
+  "description": "",
+  "imageViews": "10",
+  "creationTime": {
+    "timestamp": "1712114214",
+    "formatted": "Apr 3, 2024, 3:16:54 AM UTC"
+  },
+  "photoTakenTime": {
+    "timestamp": "1712036152",
+    "formatted": "Apr 2, 2024, 5:35:52 AM UTC"
+  },
+  "geoData": {
+    "latitude": 36.07410000000001,
+    "longitude": 140.2088611,
+    "altitude": 8.595138551288285,
+    "latitudeSpan": 0.0,
+    "longitudeSpan": 0.0
+  },
+  "geoDataExif": {
+    "latitude": 36.07410000000001,
+    "longitude": 140.2088611,
+    "altitude": 8.595138551288285,
+    "latitudeSpan": 0.0,
+    "longitudeSpan": 0.0
+  },
+  "url": "https://photos.google.com/photo/AF1QipOw4MF8-Q5IzaxlO9bpLdMndisZca_c4ZrGcn5i",
+  "googlePhotosOrigin": {
+    "mobileUpload": {
+      "deviceType": "IOS_PHONE"
+    }
+  }
+}
