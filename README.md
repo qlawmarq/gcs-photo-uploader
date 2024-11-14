@@ -57,30 +57,18 @@ This will create credentials at:
 gsutil mb -l us-central1 gs://YOUR_BUCKET_NAME
 ```
 
-### 3. Prepare Photos
+### 3. Project Structure
 
-1. Create a photos directory:
-
-```bash
-mkdir photos
 ```
-
-2. Copy your photos to this directory:
-
-```bash
-# Example: Copy all photos from another location
-cp -r /path/to/your/photos/* photos/
-
-# Or manually copy your photos to the 'photos' directory
+gcs-photo-uploader/
+├── photos/             # Source directory for photos
+│   └── logs/          # Upload history logs
+├── photo_uploader.py
+├── requirements.txt
+├── Dockerfile
+├── .env.example
+└── README.md
 ```
-
-The directory can contain subdirectories, and all supported image files will be processed recursively.
-
-Supported formats:
-
-- JPEG/JPG
-- PNG
-- HEIC/HEIF (automatically converted to JPEG)
 
 ### 4. Configuration
 
@@ -89,7 +77,6 @@ Create a `.env` file:
 ```.env
 # Google Cloud Storage settings
 PHOTO_UPLOADER_BUCKET=your-bucket-name
-PHOTO_UPLOADER_DIRECTORY=/photos
 PHOTO_UPLOADER_CONCURRENT=4
 PHOTO_UPLOADER_RENAME_FILES=true
 GOOGLE_CLOUD_PROJECT=your-project-id
@@ -106,11 +93,20 @@ docker build -t photo-uploader .
 
 # Run container
 docker run \
-    -v "$(pwd)/photos:/photos:ro" \
+    -v "$(pwd)/photos:/photos" \
     -v "$HOME/.config/gcloud:/secrets:ro" \
     --env-file .env \
     --user $(id -u):$(id -g) \
     photo-uploader
+```
+
+### 6. Check Upload History
+
+After running the uploader, check the logs in the `photos/logs` directory:
+
+```bash
+ls -l photos/logs/
+cat photos/logs/upload_history_YYYYMMDD_HHMMSS.log
 ```
 
 ## Usage Details
@@ -138,7 +134,7 @@ YYYYMMDD_HHMMSS_XXXX.ext
 ```
 
 - `YYYYMMDD_HHMMSS`: Original photo date
-- `XXXX`: Random 4-digit number
+- `XXXX`: Random string
 - `ext`: Original extension (lowercase)
 
 ### Duplicate Detection
@@ -149,37 +145,16 @@ Files are considered duplicates if any of the following match:
 - Same creation time (±2 seconds) and file size
 - Same dimensions and similar metadata
 
-### Upload History
-
-A detailed upload history is generated showing:
-
-- Original file paths
-- Destination paths in GCS
-- Duplicate detections
-- Conversion results
-
 ## Environment Variables
 
 | Variable                       | Description          | Default | Required |
 | ------------------------------ | -------------------- | ------- | -------- |
 | PHOTO_UPLOADER_BUCKET          | GCS bucket name      | -       | Yes      |
-| PHOTO_UPLOADER_DIRECTORY       | Source directory     | /photos | Yes      |
 | PHOTO_UPLOADER_CONCURRENT      | Concurrent uploads   | 4       | No       |
 | PHOTO_UPLOADER_RENAME_FILES    | Enable file renaming | false   | No       |
 | PHOTO_UPLOADER_DRY_RUN         | Enable dry run       | false   | No       |
 | GOOGLE_CLOUD_PROJECT           | Project ID           | -       | Yes      |
 | GOOGLE_APPLICATION_CREDENTIALS | Credentials path     | -       | Yes      |
-
-## Project Structure
-
-```
-gcs-photo-uploader/
-├── photo_uploader.py
-├── requirements.txt
-├── Dockerfile
-├── .env.example
-└── README.md
-```
 
 ## License
 
