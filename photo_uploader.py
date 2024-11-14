@@ -76,8 +76,8 @@ class DuplicateDetector:
         Compare metadata to determine if they are likely duplicates.
         Uses creation date and camera model for comparison.
         """
-        # Check if creation dates are close (within 2 seconds)
-        if abs((metadata1.creation_date - metadata2.creation_date).total_seconds()) > 2:
+        # Check if creation dates are close (within 1 seconds)
+        if abs((metadata1.creation_date - metadata2.creation_date).total_seconds()) > 1:
             return False
         
         # If camera models are available and match
@@ -99,7 +99,8 @@ class PhotoUploader:
             concurrent_uploads: int = 4, 
             rename_files: bool = False, 
             project_id: Optional[str] = None,
-            dry_run: bool = False
+            dry_run: bool = False,
+            directory_path: str = '/photos'
         ):
         """Initialize PhotoUploader with specified configuration."""
         self.bucket_name = bucket_name
@@ -107,6 +108,7 @@ class PhotoUploader:
         self.bucket = self.client.bucket(bucket_name)
         self.concurrent_uploads = concurrent_uploads
         self.rename_files = rename_files
+        self.directory_path = directory_path
         self.supported_formats = {'.jpg', '.jpeg', '.png', '.heic', '.heif'}
         self.upload_history: Dict[str, str] = {}
         self.logger = self._setup_logger()
@@ -213,12 +215,22 @@ class PhotoUploader:
     def _save_upload_history(self, work_dir: Path) -> None:
         """Save upload history to a log file."""
         try:
-            history_path = work_dir / 'upload_history.log'
+            photos_dir = Path(self.directory_path)
+            log_dir = photos_dir / 'logs'
+            log_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            history_path = log_dir / f'upload_history_{timestamp}.log'
+            
             with open(history_path, 'w', encoding='utf-8') as f:
+                f.write("Upload History Report\n")
+                f.write(f"Generated: {datetime.now().isoformat()}\n")
+                f.write("-" * 50 + "\n\n")
                 f.write("Original File -> Cloud Storage Path\n")
                 f.write("-" * 50 + "\n")
                 for orig, cloud in sorted(self.upload_history.items()):
                     f.write(f"{orig} -> {cloud}\n")
+            
             self.logger.info(f"Upload history saved to {history_path}")
         except Exception as e:
             self.logger.error(f"Failed to save upload history: {e}")
@@ -448,7 +460,7 @@ class PhotoUploader:
     def _prepare_file_for_upload(self, filepath: Path, work_dir: Path) -> Optional[Path]:
         """Prepare file for upload by copying to work directory and converting if necessary."""
         try:
-            base_dir = Path(os.environ.get('PHOTO_UPLOADER_DIRECTORY', '')).resolve()
+            base_dir = Path(self.directory_path).resolve()
             if not base_dir.exists():
                 base_dir = filepath.parent.resolve()
 
@@ -584,7 +596,7 @@ class PhotoUploader:
                 
                 # Generate destination path
                 date_str = metadata.creation_date.strftime('%Y%m%d_%H%M%S')
-                random_str = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+                random_str = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
                 filename = (f"{date_str}_{random_str}{filepath.suffix.lower()}"
                         if self.rename_files else filepath.name)
                 destination_path = f"{metadata.creation_date.year}/{metadata.creation_date.month:02d}/{filename}"
@@ -676,7 +688,6 @@ def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description='Upload photos to Google Cloud Storage')
     parser.add_argument('--bucket', help='Destination bucket name (override PHOTO_UPLOADER_BUCKET)')
-    parser.add_argument('--directory', help='Source directory path (override PHOTO_UPLOADER_DIRECTORY)')
     parser.add_argument('--concurrent', type=int, help='Number of concurrent uploads (override PHOTO_UPLOADER_CONCURRENT)')
     parser.add_argument('--project-id', help='Google Cloud project ID (override GOOGLE_CLOUD_PROJECT)')
     parser.add_argument('--dry-run', action='store_true', help='Perform a dry run without actual uploads')
@@ -685,7 +696,7 @@ def main():
     
     config = {
         'bucket_name': args.bucket or os.environ.get('PHOTO_UPLOADER_BUCKET'),
-        'directory_path': args.directory or os.environ.get('PHOTO_UPLOADER_DIRECTORY'),
+        'directory_path': '/photos',
         'concurrent_uploads': args.concurrent or int(os.environ.get('PHOTO_UPLOADER_CONCURRENT', '4')),
         'project_id': args.project_id or os.environ.get('GOOGLE_CLOUD_PROJECT'),
         'rename_files': os.environ.get('PHOTO_UPLOADER_RENAME_FILES', '').lower() == 'true',
@@ -708,7 +719,8 @@ def main():
         config['concurrent_uploads'],
         config['rename_files'],
         config['project_id'],
-        config['dry_run']
+        config['dry_run'],
+        config['directory_path']
     )
     uploader.process_directory(directory_path)
 

@@ -1,6 +1,7 @@
 .env
 
-photos/
+/photos/*
+!/photos/.gitkeep
 
 .DS_Store
 
